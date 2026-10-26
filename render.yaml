@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: sm-mart-catalog-socket
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: WEBHOOK_SECRET
+        sync: false

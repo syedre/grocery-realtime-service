@@ -1,6 +1,6 @@
 # SM mart catalogue WebSocket service
 
-Standalone Node.js service that broadcasts a small `catalog_changed` event to connected apps when Supabase sends a database webhook for the public `products` or `product_category` tables. It does not expose catalogue data and does not use Supabase Realtime.
+Standalone Node.js service that broadcasts a small `catalog_changed` event to connected apps when Supabase sends a database webhook for the public `products`, `product_category`, or `shop_settings` tables. It does not expose catalogue data and does not use Supabase Realtime.
 
 ## Deploy to Render
 
@@ -16,6 +16,7 @@ Create a Database Webhook for each table below, using events INSERT, UPDATE, and
 
 - schema: `public`, table: `products`
 - schema: `public`, table: `product_category`
+- schema: `public`, table: `shop_settings` (INSERT and UPDATE are sufficient; DELETE can also be enabled)
 
 For each webhook, use HTTP POST to:
 
@@ -39,6 +40,6 @@ Restart Expo with its cache cleared after changing the environment variable.
 ## Notes
 
 - This service broadcasts notifications only; clients fetch current data from Supabase with existing RLS-protected queries.
-- The client reconnects and refreshes on app foreground. WebSocket delivery cannot guarantee delivery to disconnected devices.
+- Catalogue changes broadcast `catalog_changed`; shop setting changes broadcast `shop_availability_changed`. The client reconnects and refreshes on app foreground. WebSocket delivery cannot guarantee delivery to disconnected devices.
 - Render's free service can spin down after inactivity and may take time to wake. Clients should reconnect and use the app's fallback refresh strategy.
 - This service uses an in-memory connection list and is intended for a single instance. Multiple instances require shared pub/sub so notifications reach clients connected to every instance.

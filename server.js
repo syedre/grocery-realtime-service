@@ -25,9 +25,9 @@ function safeSecretMatch(received, expected) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function broadcastCatalogChanged() {
+function broadcastChanged(type) {
   const message = JSON.stringify({
-    type: "catalog_changed",
+    type,
     changedAt: new Date().toISOString(),
   });
   for (const client of wss.clients) {
@@ -43,14 +43,14 @@ app.post("/webhooks/catalog", (req, res) => {
   }
 
   const payload = req.body ?? {};
-  if (payload.schema !== "public" || !["products", "product_category"].includes(payload.table)) {
+  if (payload.schema !== "public" || !["products", "product_category", "shop_settings"].includes(payload.table)) {
     return res.status(202).json({ ignored: true });
   }
   if (!["INSERT", "UPDATE", "DELETE"].includes(payload.type)) {
     return res.status(202).json({ ignored: true });
   }
 
-  broadcastCatalogChanged();
+  broadcastChanged(payload.table === "shop_settings" ? "shop_availability_changed" : "catalog_changed");
   return res.status(202).json({ accepted: true });
 });
 

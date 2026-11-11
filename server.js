@@ -102,7 +102,7 @@ app.post("/webhooks/catalog", (req, res) => {
       return res.status(202).json({ ignored: true });
     }
 
-    const previous = payload.old ?? {};
+    const previous = payload.old_record ?? payload.old ?? {};
     const current = payload.record ?? payload.new ?? {};
     if (
       typeof current.id !== "string" ||

@@ -30,9 +30,14 @@ function broadcastChanged(type) {
     type,
     changedAt: new Date().toISOString(),
   });
+  let delivered = 0;
   for (const client of wss.clients) {
-    if (client.readyState === WebSocket.OPEN) client.send(message);
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+      delivered += 1;
+    }
   }
+  console.info(`Broadcast ${type} to ${delivered} connected catalogue client(s).`);
 }
 
 const ORDER_STATUSES = new Set([
@@ -87,10 +92,16 @@ app.post("/webhooks/catalog", (req, res) => {
   const expected = process.env.WEBHOOK_SECRET;
   const received = req.get("x-catalog-webhook-secret");
   if (!expected || !safeSecretMatch(received, expected)) {
+    console.warn("Rejected catalogue webhook: invalid or missing secret.");
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   const payload = req.body ?? {};
+  console.info("Received database webhook:", {
+    schema: payload.schema,
+    table: payload.table,
+    event: payload.type,
+  });
   if (payload.schema !== "public") {
     return res.status(202).json({ ignored: true });
   }
@@ -121,7 +132,7 @@ app.post("/webhooks/catalog", (req, res) => {
     return res.status(202).json({ accepted: true });
   }
 
-  if (!["products", "product_category", "shop_settings"].includes(payload.table)) {
+  if (!["products", "product_variants", "product_category", "shop_settings"].includes(payload.table)) {
     return res.status(202).json({ ignored: true });
   }
   if (!["INSERT", "UPDATE", "DELETE"].includes(payload.type)) {

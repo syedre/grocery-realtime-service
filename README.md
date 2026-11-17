@@ -1,45 +1,43 @@
-# SM mart catalogue WebSocket service
+# SM mart catalogue and order realtime service
 
-Standalone Node.js service that broadcasts a small `catalog_changed` event to connected apps when Supabase sends a database webhook for the public `products`, `product_category`, or `shop_settings` tables. It does not expose catalogue data and does not use Supabase Realtime.
+This Render service keeps the existing catalogue WebSocket broadcasts and customer order-status WebSocket updates. It also sends new-order push notifications to the authenticated SM mart Admin app.
 
-## Deploy to Render
+## Existing configuration
 
-1. In Render, create a Web Service or Blueprint from this repository's default branch.
-2. The repository root contains `server.js` and `package.json`; leave the Render root directory blank.
-3. Configure `WEBHOOK_SECRET` as a secret environment variable. Keep it private.
-4. Deploy the service. The health URL should return JSON with `"status":"ok"`.
-5. The WebSocket endpoint is the service URL with `/catalog` and the `wss://` scheme.
+Keep the current `WEBHOOK_SECRET`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` (or `SUPABASE_PUBLISHABLE_KEY`) Render environment variables. Do not change the existing Supabase webhook URL or secret header.
 
-## Configure Supabase database webhooks
+## Admin order push notifications
 
-Create a Database Webhook for each table below, using events INSERT, UPDATE, and DELETE:
+1. Enable **Cloud Firestore** in the existing Firebase project `sm-delivery-app-10f03` (Native mode, default database).
+2. In Firebase Console > Project settings > Service accounts, generate a Firebase Admin SDK service-account JSON key. Keep it private.
+3. Add the complete JSON as the Render environment variable `FIREBASE_SERVICE_ACCOUNT_JSON`. Never commit this credential or put it in the Flutter app.
+4. Keep the existing Supabase Auth environment variables configured. Device registration validates the Supabase bearer token against Auth and only accepts the existing `admin@gmail.com` account.
+5. Deploy this branch after review/merge. The Flutter app registers its FCM token with `POST /admin/push-tokens` and removes it with `DELETE /admin/push-tokens`, using the Supabase access token as a Bearer token.
+6. Keep the Supabase database webhook subscribed to `orders` INSERT and UPDATE. INSERT with status `placed` sends a push; UPDATE continues to emit the existing customer-specific `order_status_changed` WebSocket event. Catalogue broadcasts are unchanged.
 
-- schema: `public`, table: `products`
-- schema: `public`, table: `product_category`
-- schema: `public`, table: `shop_settings` (INSERT and UPDATE are sufficient; DELETE can also be enabled)
+The `admin_fcm_tokens` collection is created automatically on first use. Keep client access disabled with Firestore Security Rules; this service uses the server-side Admin SDK only:
 
-For each webhook, use HTTP POST to:
+```text
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+```
 
-`https://YOUR-RENDER-SERVICE.onrender.com/webhooks/catalog`
+Collections:
+- `admin_fcm_tokens`: hashed token document IDs; stores only the FCM token, authorized admin UID, platform and update timestamp.
 
-Add these headers:
+Webhook retry de-duplication is held in process memory only; no order IDs or customer/order data are persisted in Firestore.
 
-- `Content-Type: application/json`
-- `x-catalog-webhook-secret: YOUR_WEBHOOK_SECRET`
+No Supabase tables, columns, policies, triggers, or order-processing functions are added or modified by this service.
 
-Use exactly the same secret configured in Render. Do not put this secret in the Expo app or commit it to Git.
+## Endpoints
 
-## Configure the Expo app
-
-Set this in the app's local `.env` and production build environment:
-
-`EXPO_PUBLIC_CATALOG_SOCKET_URL=wss://YOUR-RENDER-SERVICE.onrender.com/catalog`
-
-Restart Expo with its cache cleared after changing the environment variable.
-
-## Notes
-
-- This service broadcasts notifications only; clients fetch current data from Supabase with existing RLS-protected queries.
-- Catalogue changes broadcast `catalog_changed`; shop setting changes broadcast `shop_availability_changed`. The client reconnects and refreshes on app foreground. WebSocket delivery cannot guarantee delivery to disconnected devices.
-- Render's free service can spin down after inactivity and may take time to wake. Clients should reconnect and use the app's fallback refresh strategy.
-- This service uses an in-memory connection list and is intended for a single instance. Multiple instances require shared pub/sub so notifications reach clients connected to every instance.
+- `POST /admin/push-tokens` — JSON body `{"token":"...","platform":"android|ios"}`; requires the authorized admin Supabase bearer token.
+- `DELETE /admin/push-tokens` — JSON body `{"token":"..."}`; requires the same authorized admin session.
+- `POST /webhooks/catalog` — unchanged shared-secret webhook endpoint.
+- `GET /` — health check.

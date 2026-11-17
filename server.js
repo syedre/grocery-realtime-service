@@ -2,6 +2,9 @@ import crypto from "node:crypto";
 import http from "node:http";
 import express from "express";
 import { WebSocket, WebSocketServer } from "ws";
+import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getMessaging } from "firebase-admin/messaging";
 
 const app = express();
 app.use(express.json({ limit: "64kb" }));
@@ -49,6 +52,33 @@ const ORDER_STATUSES = new Set([
   "cancelled",
 ]);
 
+function firebaseReady() {
+  return getApps().length > 0;
+}
+
+function initializeFirebaseAdmin() {
+  if (firebaseReady()) return;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (!raw) {
+    console.warn("Firebase Admin is not configured; admin push notifications are disabled.");
+    return;
+  }
+  let serviceAccount;
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch {
+    throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON must contain valid JSON.");
+  }
+  initializeApp({ credential: cert(serviceAccount) });
+}
+
+initializeFirebaseAdmin();
+
+function firestore() {
+  if (!firebaseReady()) throw new Error("Firebase Admin is not configured.");
+  return getFirestore();
+}
+
 async function authenticateCustomer(accessToken) {
   const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "");
   const publishableKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLISHABLE_KEY;
@@ -70,6 +100,181 @@ async function authenticateCustomer(accessToken) {
   return typeof user?.id === "string" ? user.id : null;
 }
 
+async function authenticateAdmin(accessToken) {
+  const supabaseUrl = process.env.SUPABASE_URL?.replace(/\/$/, "");
+  const publishableKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_PUBLISHABLE_KEY;
+  if (!supabaseUrl || !publishableKey) {
+    throw new Error("Supabase Auth validation is not configured on the realtime service.");
+  }
+  const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
+    method: "GET",
+    headers: {
+      apikey: publishableKey,
+      authorization: `Bearer ${accessToken}`,
+    },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) return null;
+  const user = await response.json();
+  if (
+    typeof user?.id !== "string" ||
+    typeof user?.email !== "string" ||
+    user.email.trim().toLowerCase() !== "admin@gmail.com"
+  ) return null;
+  return { id: user.id, email: user.email };
+}
+
+async function requireAdmin(req, res) {
+  const authorization = req.get("authorization") ?? "";
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  const accessToken = match?.[1];
+  if (!accessToken || accessToken.length < 20 || accessToken.length > 8192) {
+    res.status(401).json({ error: "Authentication required" });
+    return null;
+  }
+  try {
+    const admin = await authenticateAdmin(accessToken);
+    if (!admin) {
+      res.status(403).json({ error: "Admin access only" });
+      return null;
+    }
+    return admin;
+  } catch (error) {
+    console.error("Admin token authentication failed:", error.message);
+    res.status(503).json({ error: "Authentication unavailable" });
+    return null;
+  }
+}
+
+const adminTokens = () => firestore().collection("admin_fcm_tokens");
+
+app.post("/admin/push-tokens", async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  const token = req.body?.token;
+  const platform = req.body?.platform;
+  if (
+    typeof token !== "string" ||
+    token.length < 100 ||
+    token.length > 4096 ||
+    !["android", "ios"].includes(platform)
+  ) {
+    return res.status(400).json({ error: "A valid FCM token and platform are required." });
+  }
+  try {
+    const tokenId = crypto.createHash("sha256").update(token).digest("hex");
+    await adminTokens().doc(tokenId).set({
+      token,
+      uid: admin.id,
+      email: "admin@gmail.com",
+      platform,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    return res.status(200).json({ registered: true });
+  } catch (error) {
+    console.error("Admin FCM token registration failed:", error.message);
+    return res.status(503).json({ error: "Token registration unavailable" });
+  }
+});
+
+app.delete("/admin/push-tokens", async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  const token = req.body?.token;
+  if (typeof token !== "string" || token.length < 100 || token.length > 4096) {
+    return res.status(400).json({ error: "A valid FCM token is required." });
+  }
+  try {
+    const tokenId = crypto.createHash("sha256").update(token).digest("hex");
+    const ref = adminTokens().doc(tokenId);
+    const snapshot = await ref.get();
+    if (snapshot.exists && snapshot.data()?.uid === admin.id) await ref.delete();
+    return res.status(200).json({ removed: true });
+  } catch (error) {
+    console.error("Admin FCM token removal failed:", error.message);
+    return res.status(503).json({ error: "Token removal unavailable" });
+  }
+});
+
+async function sendNewOrderNotification(order) {
+  if (!firebaseReady()) {
+    console.warn("Skipped new-order push: Firebase Admin is not configured.");
+    return;
+  }
+
+  const db = firestore();
+  const eventId = crypto.createHash("sha256").update(order.id).digest("hex");
+  const eventRef = db.collection("admin_push_events").doc(eventId);
+  const claim = await db.runTransaction(async (transaction) => {
+    const existing = await transaction.get(eventRef);
+    if (existing.exists) return false;
+    transaction.create(eventRef, {
+      orderId: order.id,
+      status: "sending",
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    return true;
+  });
+  if (!claim) {
+    console.info(`Skipped duplicate new-order push for order ${order.id}.`);
+    return;
+  }
+
+  try {
+    const snapshot = await adminTokens().get();
+    const docs = snapshot.docs;
+    if (docs.length === 0) {
+      await eventRef.set({ status: "no_registered_devices", completedAt: FieldValue.serverTimestamp() }, { merge: true });
+      console.info("No registered admin FCM devices; new-order push was not sent.");
+      return;
+    }
+
+    const invalidRefs = [];
+    let successCount = 0;
+    for (let offset = 0; offset < docs.length; offset += 500) {
+      const batch = docs.slice(offset, offset + 500);
+      const tokens = batch.map((doc) => doc.data().token).filter((value) => typeof value === "string");
+      if (tokens.length === 0) continue;
+      const response = await getMessaging().sendEachForMulticast({
+        tokens,
+        notification: {
+          title: "New customer order",
+          body: order.orderNumber ? `Order #${order.orderNumber} has been placed.` : "A new customer order has been placed.",
+        },
+        data: {
+          type: "new_order",
+          orderId: order.id,
+          orderNumber: order.orderNumber ?? "",
+        },
+        android: { priority: "high", notification: { channelId: "sm_mart_orders", sound: "default" } },
+        apns: { payload: { aps: { sound: "default" } } },
+      });
+      successCount += response.successCount;
+      response.responses.forEach((result, index) => {
+        if (
+          !result.success &&
+          ["messaging/invalid-registration-token", "messaging/registration-token-not-registered"].includes(result.error?.code)
+        ) invalidRefs.push(batch[index].ref);
+      });
+    }
+    if (invalidRefs.length) {
+      const batch = db.batch();
+      invalidRefs.forEach((ref) => batch.delete(ref));
+      await batch.commit();
+    }
+    await eventRef.set({
+      status: "sent",
+      successCount,
+      invalidTokenCount: invalidRefs.length,
+      completedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    console.info(`New-order push processed for order ${order.id}: ${successCount} device(s) accepted.`);
+  } catch (error) {
+    await eventRef.delete().catch(() => {});
+    throw error;
+  }
+}
+
 function broadcastOrderStatusChanged(order) {
   const message = JSON.stringify({
     type: "order_status_changed",
@@ -88,7 +293,7 @@ function broadcastOrderStatusChanged(order) {
   }
 }
 
-app.post("/webhooks/catalog", (req, res) => {
+app.post("/webhooks/catalog", async (req, res) => {
   const expected = process.env.WEBHOOK_SECRET;
   const received = req.get("x-catalog-webhook-secret");
   if (!expected || !safeSecretMatch(received, expected)) {
@@ -106,15 +311,28 @@ app.post("/webhooks/catalog", (req, res) => {
     return res.status(202).json({ ignored: true });
   }
 
-  // Order events are sent only to sockets authenticated as the order owner.
-  // The webhook contains the row data; no order details are broadcast.
   if (payload.table === "orders") {
+    const previous = payload.old_record ?? payload.old ?? {};
+    const current = payload.record ?? payload.new ?? {};
+    if (payload.type === "INSERT") {
+      if (typeof current.id !== "string" || current.status !== "placed") {
+        return res.status(202).json({ ignored: true });
+      }
+      try {
+        await sendNewOrderNotification({
+          id: current.id,
+          orderNumber: current.order_number == null ? null : String(current.order_number),
+        });
+        return res.status(202).json({ accepted: true, notification: "processed" });
+      } catch (error) {
+        console.error("New-order push notification failed:", error.message);
+        return res.status(503).json({ error: "Push notification delivery failed" });
+      }
+    }
+
     if (payload.type !== "UPDATE") {
       return res.status(202).json({ ignored: true });
     }
-
-    const previous = payload.old_record ?? payload.old ?? {};
-    const current = payload.record ?? payload.new ?? {};
     if (
       typeof current.id !== "string" ||
       typeof current.user_id !== "string" ||

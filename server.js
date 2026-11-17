@@ -196,35 +196,27 @@ app.delete("/admin/push-tokens", async (req, res) => {
   }
 });
 
+const processedOrderPushes = new Set();
+
 async function sendNewOrderNotification(order) {
   if (!firebaseReady()) {
     console.warn("Skipped new-order push: Firebase Admin is not configured.");
     return;
   }
-
-  const db = firestore();
-  const eventId = crypto.createHash("sha256").update(order.id).digest("hex");
-  const eventRef = db.collection("admin_push_events").doc(eventId);
-  const claim = await db.runTransaction(async (transaction) => {
-    const existing = await transaction.get(eventRef);
-    if (existing.exists) return false;
-    transaction.create(eventRef, {
-      orderId: order.id,
-      status: "sending",
-      createdAt: FieldValue.serverTimestamp(),
-    });
-    return true;
-  });
-  if (!claim) {
+  if (processedOrderPushes.has(order.id)) {
     console.info(`Skipped duplicate new-order push for order ${order.id}.`);
     return;
   }
+  processedOrderPushes.add(order.id);
+  if (processedOrderPushes.size > 10_000) {
+    processedOrderPushes.delete(processedOrderPushes.values().next().value);
+  }
 
   try {
+    const db = firestore();
     const snapshot = await adminTokens().get();
     const docs = snapshot.docs;
     if (docs.length === 0) {
-      await eventRef.set({ status: "no_registered_devices", completedAt: FieldValue.serverTimestamp() }, { merge: true });
       console.info("No registered admin FCM devices; new-order push was not sent.");
       return;
     }
@@ -262,15 +254,9 @@ async function sendNewOrderNotification(order) {
       invalidRefs.forEach((ref) => batch.delete(ref));
       await batch.commit();
     }
-    await eventRef.set({
-      status: "sent",
-      successCount,
-      invalidTokenCount: invalidRefs.length,
-      completedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
     console.info(`New-order push processed for order ${order.id}: ${successCount} device(s) accepted.`);
   } catch (error) {
-    await eventRef.delete().catch(() => {});
+    processedOrderPushes.delete(order.id);
     throw error;
   }
 }

@@ -15,7 +15,7 @@ Keep the current `WEBHOOK_SECRET`, `SUPABASE_URL`, and `SUPABASE_ANON_KEY` (or `
 5. Deploy this branch after review/merge. The Flutter app registers its FCM token with `POST /admin/push-tokens` and removes it with `DELETE /admin/push-tokens`, using the Supabase access token as a Bearer token.
 6. Keep the Supabase database webhook subscribed to `orders` INSERT and UPDATE. INSERT with status `placed` sends a push; UPDATE continues to emit the existing customer-specific `order_status_changed` WebSocket event. Catalogue broadcasts are unchanged.
 
-Firestore collections are created automatically on first use. Keep client access disabled with Firestore Security Rules; this service uses the server-side Admin SDK only:
+The `admin_fcm_tokens` collection is created automatically on first use. Keep client access disabled with Firestore Security Rules; this service uses the server-side Admin SDK only:
 
 ```text
 rules_version = '2';
@@ -29,8 +29,9 @@ service cloud.firestore {
 ```
 
 Collections:
-- `admin_fcm_tokens`: hashed token document IDs; stores the token, admin UID, platform and update timestamp.
-- `admin_push_events`: one idempotency record per order ID to avoid duplicate notifications on webhook retries.
+- `admin_fcm_tokens`: hashed token document IDs; stores only the FCM token, authorized admin UID, platform and update timestamp.
+
+Webhook retry de-duplication is held in process memory only; no order IDs or customer/order data are persisted in Firestore.
 
 No Supabase tables, columns, policies, triggers, or order-processing functions are added or modified by this service.
 

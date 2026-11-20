@@ -6,27 +6,15 @@ import { registerOrderSocket } from "./src/websocket/orders.js";
 
 initializeFirebaseAdmin();
 
+const app = createApp();
+const server = http.createServer(app);
 const wss = new WebSocketServer({
-  noServer: true,
+  server,
   path: "/catalog",
   maxPayload: 1024,
   perMessageDeflate: false,
 });
-
-const app = createApp(wss);
-const server = http.createServer(app);
-
-// Preserve the existing /catalog WebSocket upgrade path.
-server.on("upgrade", (request, socket, head) => {
-  const pathname = new URL(request.url, "http://localhost").pathname;
-  if (pathname !== "/catalog") {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(request, socket, head, (webSocket) => {
-    wss.emit("connection", webSocket, request);
-  });
-});
+app.locals.wss = wss;
 
 registerOrderSocket(wss);
 
